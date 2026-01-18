@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docker Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: #1e1e1e;
+            color: #fff;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: #2d2d2d;
+            padding: 15px 20px;
+            border-bottom: 2px solid #3e3e3e;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            color: #4ec9b0;
+        }
+
+        .status {
+            display: inline-block;
+            margin-left: 20px;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+
+        .status.connected {
+            background: #4ec9b0;
+            color: #000;
+        }
+
+        .status.disconnected {
+            background: #f48771;
+            color: #000;
+        }
+
+        .terminal-container {
+            flex: 1;
+            padding: 20px;
+            overflow: hidden;
+        }
+
+        #terminal {
+            height: 100%;
+            background: #000;
+            border-radius: 5px;
+            padding: 10px;
+        }
+
+        .controls {
+            background: #2d2d2d;
+            padding: 10px 20px;
+            border-top: 2px solid #3e3e3e;
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            background: #4ec9b0;
+            border: none;
+            padding: 8px 16px;
+            color: #000;
+            cursor: pointer;
+            border-radius: 3px;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #5fd9c0;
+        }
+
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        .info {
+            font-size: 12px;
+            color: #888;
+            margin-left: auto;
+            line-height: 32px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🐳 Docker Terminal Interface</h1>
+        <span id="status" class="status disconnected">Disconnected</span>
+    </div>
+
+    <div class="terminal-container">
+        <div id="terminal"></div>
+    </div>
+
+    <div class="controls">
+        <button id="connectBtn" onclick="connectTerminal()">Connect</button>
+        <button id="clearBtn" onclick="clearTerminal()" disabled>Clear</button>
+        <button id="disconnectBtn" onclick="disconnectTerminal()" disabled>Disconnect</button>
+        <div class="info">Type commands and press Enter</div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+
+    <script>
+        let socket;
+        let term;
+        let fitAddon;
+
+        // Initialize terminal
+        function initTerminal() {
+            console.log('Initializing terminal...');
+            
+            term = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                fontFamily: 'Courier New, monospace',
+                theme: {
+                    background: '#000000',
+                    foreground: '#ffffff',
+                    cursor: '#4ec9b0',
+                    selection: '#ffffff40',
+                },
+                allowProposedApi: true,
+                convertEol: true  // Convert \n to \r\n automatically
+            });
+
+            fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            
+            const terminalElement = document.getElementById('terminal');
+            console.log('Terminal element:', terminalElement);
+            
+            term.open(terminalElement);
+            fitAddon.fit();
+            
+            console.log('Terminal opened. Cols:', term.cols, 'Rows:', term.rows);
+
+            // Handle terminal input
+            term.onData((data) => {
+                console.log('Terminal input:', data);
+                if (socket && socket.connected) {
+                    socket.emit('terminal-input', data);
+                }
+            });
+
+            // Handle window resize
+            window.addEventListener('resize', () => {
+                fitAddon.fit();
+                if (socket && socket.connected) {
+                    socket.emit('terminal-resize', {
+                        cols: term.cols,
+                        rows: term.rows
+                    });
+                }
+            });
+
+            term.writeln('Click "Connect" to start the Docker terminal session...');
+            term.writeln('');
+        }
+
+        // Connect to backend
+        function connectTerminal() {
+            console.log('Connecting to backend...');
+            updateStatus('connecting');
+            
+            socket = io('http://localhost:3000');
+
+            socket.on('connect', () => {
+                console.log('Socket connected! ID:', socket.id);
+                term.writeln('\r\n\x1b[32mSocket connected! Creating terminal session...\x1b[0m\r\n');
+                socket.emit('create-terminal');
+            });
+
+            socket.on('terminal-ready', () => {
+                console.log('Terminal ready!');
+                updateStatus('connected');
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('clearBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = false;
+                
+                term.writeln('\x1b[32mTerminal ready! You can now type commands.\x1b[0m\r\n');
+                
+                // Send resize info
+                socket.emit('terminal-resize', {
+                    cols: term.cols,
+                    rows: term.rows
+                });
+            });
+
+            socket.on('terminal-output', (data) => {
+                console.log('Received output:', data.substring(0, 50) + (data.length > 50 ? '...' : ''));
+                term.write(data);
+            });
+
+            socket.on('terminal-error', (error) => {
+                console.error('Terminal error:', error);
+                term.writeln(`\r\n\x1b[31mError: ${error}\x1b[0m\r\n`);
+                updateStatus('disconnected');
+            });
+
+            socket.on('disconnect', () => {
+                console.log('Socket disconnected');
+                updateStatus('disconnected');
+                term.writeln('\r\n\x1b[33mDisconnected from server\x1b[0m\r\n');
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('clearBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = true;
+            });
+
+            socket.on('connect_error', (error) => {
+                console.error('Connection error:', error);
+                term.writeln(`\r\n\x1b[31mConnection error: ${error.message}\x1b[0m\r\n`);
+                updateStatus('disconnected');
+            });
+        }
+
+        // Disconnect terminal
+        function disconnectTerminal() {
+            if (socket) {
+                socket.disconnect();
+                updateStatus('disconnected');
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('clearBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = true;
+            }
+        }
+
+        // Clear terminal
+        function clearTerminal() {
+            term.clear();
+        }
+
+        // Update connection status
+        function updateStatus(status) {
+            const statusEl = document.getElementById('status');
+            statusEl.className = 'status ' + (status === 'connected' ? 'connected' : 'disconnected');
+            
+            if (status === 'connected') {
+                statusEl.textContent = 'Connected';
+            } else if (status === 'connecting') {
+                statusEl.textContent = 'Connecting...';
+            } else {
+                statusEl.textContent = 'Disconnected';
+            }
+        }
+
+        // Initialize on page load
+        window.onload = () => {
+            initTerminal();
+        };
+    </script>Docker Terminal Interface
+</body>
+</html>

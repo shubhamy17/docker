@@ -1,0 +1,178 @@
+const express = require('express');
+const http = require('http');
+const socketIO = require('socket.io');
+const pty = require('node-pty');
+const os = require('os');
+const { execSync } = require('child_process');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIO(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Store PTY sessions for each connected user
+const ptySessions = new Map();
+
+// Serve static files (frontend)
+app.use(express.static('public'));
+
+// Docker container name/ID - UPDATE THIS!
+const DOCKER_CONTAINER = 'my-terminal-container';
+
+// Find docker binary path (important for macOS)
+function findDockerPath() {
+  const possiblePaths = [
+    '/usr/local/bin/docker',
+    '/usr/bin/docker',
+    '/opt/homebrew/bin/docker',
+  ];
+  
+  for (const path of possiblePaths) {
+    try {
+      execSync(`${path} --version`, { stdio: 'ignore' });
+      console.log(`Docker found at: ${path}`);
+      return path;
+    } catch (e) {
+      // continue
+    }
+  }
+  
+  // Try to find via 'which' command
+  try {
+    const path = execSync('which docker', { encoding: 'utf8' }).trim();
+    console.log(`Docker found at: ${path}`);
+    return path;
+  } catch (e) {
+    throw new Error('Docker not found. Please ensure Docker is installed and running.');
+  }
+}
+
+let DOCKER_PATH;
+try {
+  DOCKER_PATH = findDockerPath();
+} catch (error) {
+  console.error('ERROR:', error.message);
+  process.exit(1);
+}
+
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+
+  // Create a new PTY session for this user
+  socket.on('create-terminal', () => {
+    try {
+      // First, verify the container exists and is running
+      try {
+        const result = execSync(`${DOCKER_PATH} inspect -f '{{.State.Running}}' ${DOCKER_CONTAINER}`, 
+          { encoding: 'utf8' }).trim();
+        
+        if (result !== 'true') {
+          socket.emit('terminal-error', `Container '${DOCKER_CONTAINER}' exists but is not running. Start it with: docker start ${DOCKER_CONTAINER}`);
+          return;
+        }
+      } catch (e) {
+        socket.emit('terminal-error', `Container '${DOCKER_CONTAINER}' not found. Create it with: docker run -d --name ${DOCKER_CONTAINER} test-terminal`);
+        return;
+      }
+
+      // APPROACH 1: Use shell wrapper (more compatible)
+      // Spawn bash/sh that will execute docker exec
+      const shell = os.platform() === 'win32' ? 'cmd.exe' : '/bin/bash';
+      const shellArgs = os.platform() === 'win32' 
+        ? ['/c', `${DOCKER_PATH} exec -i ${DOCKER_CONTAINER} /bin/bash`]
+        : ['-c', `${DOCKER_PATH} exec -i ${DOCKER_CONTAINER} /bin/bash`];
+      
+      console.log(`Spawning: ${shell} ${shellArgs.join(' ')}`);
+      
+      const ptyProcess = pty.spawn(shell, shellArgs, {
+        name: 'xterm-color',
+        cols: 80,
+        rows: 30,
+        cwd: process.env.HOME || process.cwd(),
+        env: {
+          ...process.env,
+          PATH: '/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:' + (process.env.PATH || ''),
+          TERM: 'xterm-256color'
+        }
+      });
+
+      // Store the PTY session
+      ptySessions.set(socket.id, ptyProcess);
+
+      // Send initial connection message
+      socket.emit('terminal-output', '\r\n*** Connected to Docker container ***\r\n\r\n');
+
+      // Listen to PTY output and send to client
+      ptyProcess.onData((data) => {
+        socket.emit('terminal-output', data);
+      });
+
+      // Handle PTY exit
+      ptyProcess.onExit(({ exitCode, signal }) => {
+        console.log(`PTY process exited for ${socket.id}. Code: ${exitCode}, Signal: ${signal}`);
+        ptySessions.delete(socket.id);
+        socket.emit('terminal-output', '\r\n*** Session ended ***\r\n');
+      });
+
+      socket.emit('terminal-ready');
+      console.log(`Terminal created for ${socket.id}`);
+
+    } catch (error) {
+      console.error('Error creating terminal:', error);
+      socket.emit('terminal-error', `Failed to create terminal: ${error.message}`);
+    }
+  });
+
+  // Handle input from client
+  socket.on('terminal-input', (data) => {
+    const ptyProcess = ptySessions.get(socket.id);
+    if (ptyProcess) {
+      ptyProcess.write(data);
+    }
+  });
+
+  // Handle terminal resize
+  socket.on('terminal-resize', ({ cols, rows }) => {
+    const ptyProcess = ptySessions.get(socket.id);
+    if (ptyProcess) {
+      try {
+        ptyProcess.resize(cols, rows);
+      } catch (e) {
+        // Ignore resize errors
+      }
+    }
+  });
+
+  // Clean up on disconnect
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+    const ptyProcess = ptySessions.get(socket.id);
+    if (ptyProcess) {
+      try {
+        ptyProcess.kill();
+      } catch (e) {
+        // Ignore kill errors
+      }
+      ptySessions.delete(socket.id);
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`\n========================================`);
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Docker path: ${DOCKER_PATH}`);
+  console.log(`Docker container: ${DOCKER_CONTAINER}`);
+  console.log(`========================================`);
+  console.log(`\nVerify container is running:`);
+  console.log(`  docker ps | grep ${DOCKER_CONTAINER}`);
+  console.log(`\nIf container doesn't exist:`);
+  console.log(`  docker build -t test-terminal .`);
+  console.log(`  docker run -d --name ${DOCKER_CONTAINER} test-terminal`);
+  console.log(`========================================\n`);
+});
